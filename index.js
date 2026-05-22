@@ -1,5 +1,6 @@
 require("dotenv").config();
 const express = require("express");
+const { createHmac } = require("node:crypto");
 const QRCode = require("qrcode");
 const { Client, LocalAuth } = require("whatsapp-web.js");
 
@@ -112,13 +113,21 @@ client.on("message", async (msg) => {
 
     if (CRM_WEBHOOK_URL) {
       try {
+        const bodyStr = JSON.stringify(payload);
+        // HMAC-SHA256 of the exact serialized bytes, so the CRM can verify
+        // the body wasn't altered in transit. CRM accepts both bare hex
+        // and "sha256=<hex>"; we use the prefixed form.
+        const signature =
+          "sha256=" +
+          createHmac("sha256", BRIDGE_SECRET).update(bodyStr).digest("hex");
         const res = await fetch(CRM_WEBHOOK_URL, {
           method: "POST",
           headers: {
             "content-type": "application/json",
             "x-bridge-secret": BRIDGE_SECRET,
+            "x-bridge-signature": signature,
           },
-          body: JSON.stringify(payload),
+          body: bodyStr,
         });
         if (!res.ok) {
           console.error("[wa] webhook non-ok:", res.status, await res.text());
@@ -135,8 +144,23 @@ client.on("message", async (msg) => {
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
+const { timingSafeEqual } = require("node:crypto");
+const BRIDGE_SECRET_BUF = Buffer.from(BRIDGE_SECRET, "utf8");
+
 function requireSecret(req, res, next) {
-  if (req.headers["x-bridge-secret"] !== BRIDGE_SECRET) {
+  const hdr = req.headers["x-bridge-secret"];
+  if (typeof hdr !== "string") {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
+  }
+  const got = Buffer.from(hdr, "utf8");
+  // Constant-time compare; length-mismatch fast-path replaced by an
+  // equal-length dummy compare to avoid a timing channel.
+  if (got.length !== BRIDGE_SECRET_BUF.length) {
+    const pad = Buffer.alloc(BRIDGE_SECRET_BUF.length);
+    timingSafeEqual(pad, pad);
+    return res.status(401).json({ ok: false, error: "unauthorized" });
+  }
+  if (!timingSafeEqual(got, BRIDGE_SECRET_BUF)) {
     return res.status(401).json({ ok: false, error: "unauthorized" });
   }
   next();

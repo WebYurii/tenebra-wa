@@ -8,6 +8,9 @@ const PORT = parseInt(process.env.PORT || "8005", 10);
 const HOST = process.env.HOST || "127.0.0.1";
 const BRIDGE_SECRET = process.env.BRIDGE_SECRET;
 const CRM_WEBHOOK_URL = process.env.CRM_WEBHOOK_URL;
+const CRM_CALL_WEBHOOK_URL =
+  process.env.CRM_CALL_WEBHOOK_URL ||
+  (CRM_WEBHOOK_URL ? CRM_WEBHOOK_URL + "/call" : null);
 const CHROME_PATH = process.env.CHROME_PATH;
 
 if (!BRIDGE_SECRET) {
@@ -94,6 +97,31 @@ client.on("disconnected", (reason) => {
   }, 5000);
 });
 
+// Shared helper: POST a JSON payload to a CRM webhook URL with the
+// bridge secret + HMAC signature of the exact serialized bytes.
+async function postToWebhook(url, payload, label) {
+  try {
+    const bodyStr = JSON.stringify(payload);
+    const signature =
+      "sha256=" +
+      createHmac("sha256", BRIDGE_SECRET).update(bodyStr).digest("hex");
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-bridge-secret": BRIDGE_SECRET,
+        "x-bridge-signature": signature,
+      },
+      body: bodyStr,
+    });
+    if (!res.ok) {
+      console.error(`[wa] ${label} non-ok:`, res.status, await res.text());
+    }
+  } catch (e) {
+    console.error(`[wa] ${label} error:`, e.message);
+  }
+}
+
 client.on("message", async (msg) => {
   try {
     if (msg.fromMe) return;
@@ -101,43 +129,59 @@ client.on("message", async (msg) => {
     if (!msg.from.endsWith("@c.us")) return;
 
     const phone = "+" + msg.from.replace("@c.us", "");
+    // notifyName is the sender's profile name as visible in WhatsApp (what
+    // shows up next to the avatar). Falls back to null when WhatsApp didn't
+    // attach one — we let the CRM decide on a placeholder.
+    const pushname = msg._data?.notifyName ?? null;
     const payload = {
       from: phone,
+      pushname,
       text: msg.body || "",
       messageId: msg.id?._serialized,
       timestamp: msg.timestamp,
       type: msg.type,
       hasMedia: msg.hasMedia,
     };
-    console.log("[wa] inbound from", phone, "len=", (msg.body || "").length);
+    console.log(
+      "[wa] inbound from",
+      phone,
+      pushname ? `(~${pushname})` : "",
+      "len=",
+      (msg.body || "").length
+    );
 
     if (CRM_WEBHOOK_URL) {
-      try {
-        const bodyStr = JSON.stringify(payload);
-        // HMAC-SHA256 of the exact serialized bytes, so the CRM can verify
-        // the body wasn't altered in transit. CRM accepts both bare hex
-        // and "sha256=<hex>"; we use the prefixed form.
-        const signature =
-          "sha256=" +
-          createHmac("sha256", BRIDGE_SECRET).update(bodyStr).digest("hex");
-        const res = await fetch(CRM_WEBHOOK_URL, {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "x-bridge-secret": BRIDGE_SECRET,
-            "x-bridge-signature": signature,
-          },
-          body: bodyStr,
-        });
-        if (!res.ok) {
-          console.error("[wa] webhook non-ok:", res.status, await res.text());
-        }
-      } catch (e) {
-        console.error("[wa] webhook error:", e.message);
-      }
+      await postToWebhook(CRM_WEBHOOK_URL, payload, "webhook");
     }
   } catch (e) {
     console.error("[wa] message handler error:", e);
+  }
+});
+
+// Incoming call events. whatsapp-web.js emits these for both voice and
+// video, regardless of whether the call is answered or missed — we
+// forward the bare facts and let the CRM decide presentation.
+client.on("call", async (call) => {
+  try {
+    if (!call?.from || !call.from.endsWith("@c.us")) return;
+    const phone = "+" + call.from.replace("@c.us", "");
+    const payload = {
+      from: phone,
+      callId: call.id ?? null,
+      timestamp: call.timestamp ?? Math.floor(Date.now() / 1000),
+      isVideo: !!call.isVideo,
+      // The library doesn't surface a clean "missed" flag; the call event
+      // fires on incoming ring. If we never auto-answer (we don't), this
+      // is effectively a missed/unanswered call from the user's POV.
+      missed: true,
+    };
+    console.log("[wa] incoming call from", phone, payload.isVideo ? "(video)" : "");
+
+    if (CRM_CALL_WEBHOOK_URL) {
+      await postToWebhook(CRM_CALL_WEBHOOK_URL, payload, "call-webhook");
+    }
+  } catch (e) {
+    console.error("[wa] call handler error:", e);
   }
 });
 

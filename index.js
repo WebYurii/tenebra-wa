@@ -11,6 +11,9 @@ const CRM_WEBHOOK_URL = process.env.CRM_WEBHOOK_URL;
 const CRM_CALL_WEBHOOK_URL =
   process.env.CRM_CALL_WEBHOOK_URL ||
   (CRM_WEBHOOK_URL ? CRM_WEBHOOK_URL + "/call" : null);
+const CRM_STATUS_WEBHOOK_URL =
+  process.env.CRM_STATUS_WEBHOOK_URL ||
+  (CRM_WEBHOOK_URL ? CRM_WEBHOOK_URL + "/status" : null);
 const CHROME_PATH = process.env.CHROME_PATH;
 
 if (!BRIDGE_SECRET) {
@@ -71,6 +74,7 @@ client.on("auth_failure", (msg) => {
   console.error("[wa] auth_failure:", msg);
   state.status = "auth_failure";
   state.lastError = String(msg);
+  notifyStatus("auth_failure", String(msg));
 });
 
 client.on("ready", () => {
@@ -87,15 +91,30 @@ client.on("ready", () => {
 
 client.on("disconnected", (reason) => {
   console.log("[wa] disconnected:", reason);
+  const previousPhone = state.phone;
   state.status = "disconnected";
   state.lastError = String(reason);
   state.phone = null;
   state.readySince = null;
+  notifyStatus("disconnected", String(reason), previousPhone);
   setTimeout(() => {
     console.log("[wa] re-initializing after disconnect");
     client.initialize().catch((e) => console.error("[wa] init error:", e));
   }, 5000);
 });
+
+// Fire a bridge status transition to the CRM. Used for negative
+// transitions (disconnected, auth_failure, error) so the CRM can ping
+// the operator in Telegram — when the bridge drops, every other
+// inbound flow stops too, so this is the only signal they'd get.
+async function notifyStatus(status, reason, phone) {
+  if (!CRM_STATUS_WEBHOOK_URL) return;
+  await postToWebhook(
+    CRM_STATUS_WEBHOOK_URL,
+    { status, reason: reason ?? null, phone: phone ?? null },
+    `status-${status}`
+  );
+}
 
 // Shared helper: POST a JSON payload to a CRM webhook URL with the
 // bridge secret + HMAC signature of the exact serialized bytes.

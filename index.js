@@ -122,9 +122,41 @@ async function postToWebhook(url, payload, label) {
   }
 }
 
-client.on("message", async (msg) => {
+// message_create fires for both incoming AND outgoing (including sends
+// from this very bridge, the phone, or any other linked device).
+// We branch on fromMe to build the right payload:
+//   * inbound  → use msg.from as the other party
+//   * outbound → use msg.to; lets the CRM record what the operator
+//     wrote from the phone, so the timeline stays accurate even when
+//     Yurik replies outside the CRM. The CRM dedupes by messageId so
+//     it doesn't double-log sends that originated from /send.
+client.on("message_create", async (msg) => {
   try {
-    if (msg.fromMe) return;
+    if (msg.fromMe) {
+      // Outbound — only contact chats, skip groups and broadcasts
+      if (!msg.to || !msg.to.endsWith("@c.us")) return;
+      const phone = "+" + msg.to.replace("@c.us", "");
+      const payload = {
+        from: phone,           // CRM treats `from` as "the other party"
+        direction: "out",
+        text: msg.body || "",
+        messageId: msg.id?._serialized,
+        timestamp: msg.timestamp,
+        type: msg.type,
+        hasMedia: msg.hasMedia,
+      };
+      console.log(
+        "[wa] outbound to",
+        phone,
+        "len=",
+        (msg.body || "").length
+      );
+      if (CRM_WEBHOOK_URL) {
+        await postToWebhook(CRM_WEBHOOK_URL, payload, "webhook-out");
+      }
+      return;
+    }
+
     if (msg.from.endsWith("@g.us")) return;
     if (!msg.from.endsWith("@c.us")) return;
 
@@ -135,6 +167,7 @@ client.on("message", async (msg) => {
     const pushname = msg._data?.notifyName ?? null;
     const payload = {
       from: phone,
+      direction: "in",
       pushname,
       text: msg.body || "",
       messageId: msg.id?._serialized,

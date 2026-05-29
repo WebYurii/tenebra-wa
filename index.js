@@ -38,6 +38,9 @@ const state = {
 
 const lastSendAt = { ts: 0 };
 const MIN_SEND_INTERVAL_MS = 5000;
+// Don't try to download/forward media larger than this (memory + transcribe
+// cost guard). Bigger files are logged as a note with the filename only.
+const MAX_MEDIA_BYTES = 25 * 1024 * 1024;
 
 // Baileys is chatty on its own logger; keep it quiet unless asked.
 const logger = pino({ level: process.env.WA_LOG_LEVEL || "warn" });
@@ -46,6 +49,7 @@ let sock = null; // current Baileys socket instance
 let saveCreds = null; // creds persister bound to AUTH_DIR
 let starting = false; // guard against overlapping (re)connects
 let LOGGED_OUT_CODE = 401; // DisconnectReason.loggedOut, set on first import
+let downloadMediaMessage = null; // bound from the Baileys import in startSock
 
 // ---------------------------------------------------------------------------
 // CRM webhook plumbing — unchanged from the wwebjs bridge so the CRM side
@@ -134,13 +138,15 @@ function resolvePnJid(primaryJid, altJid) {
   return null;
 }
 
-// Unwrap ephemeral / view-once envelopes so we read the real content node.
+// Unwrap ephemeral / view-once / doc-with-caption envelopes so we read the
+// real content node.
 function unwrap(message) {
   return (
     message?.ephemeralMessage?.message ||
     message?.viewOnceMessage?.message ||
     message?.viewOnceMessageV2?.message ||
     message?.viewOnceMessageV2Extension?.message ||
+    message?.documentWithCaptionMessage?.message ||
     message ||
     null
   );
@@ -187,6 +193,101 @@ function hasMediaContent(message) {
       m.documentMessage ||
       m.stickerMessage)
   );
+}
+
+// Describe a downloadable media node (or null for non-media). `kind` maps to
+// the CRM's media kinds; voice = ptt audio.
+function mediaDescriptor(message) {
+  const m = unwrap(message);
+  if (!m) return null;
+  if (m.imageMessage)
+    return { kind: "image", node: m.imageMessage, mime: m.imageMessage.mimetype || "image/jpeg", filename: null, durationSec: null };
+  if (m.videoMessage)
+    return { kind: "video", node: m.videoMessage, mime: m.videoMessage.mimetype || "video/mp4", filename: null, durationSec: Number(m.videoMessage.seconds) || null };
+  if (m.audioMessage)
+    return { kind: m.audioMessage.ptt ? "voice" : "audio", node: m.audioMessage, mime: m.audioMessage.mimetype || "audio/ogg", filename: null, durationSec: Number(m.audioMessage.seconds) || null };
+  if (m.documentMessage)
+    return { kind: "document", node: m.documentMessage, mime: m.documentMessage.mimetype || "application/octet-stream", filename: m.documentMessage.fileName || null, durationSec: null };
+  if (m.stickerMessage)
+    return { kind: "sticker", node: m.stickerMessage, mime: m.stickerMessage.mimetype || "image/webp", filename: null, durationSec: null };
+  return null;
+}
+
+// Download a media message and forward the bytes (+ metadata) to the CRM's
+// multipart media webhook. Falls back to a plain text note if download fails
+// or the file is too big, so the message is never silently dropped.
+async function postMedia(msg, phone, pushname, desc, caption, ts) {
+  if (!CRM_WEBHOOK_URL) return;
+  const mediaUrl = CRM_WEBHOOK_URL + "/media";
+
+  const sendNote = async (note) => {
+    await postToWebhook(
+      CRM_WEBHOOK_URL,
+      {
+        from: phone,
+        direction: "in",
+        pushname,
+        text: caption || note || "",
+        messageId: msg.key?.id,
+        timestamp: ts,
+        type: desc.kind,
+        hasMedia: true,
+      },
+      "webhook"
+    );
+  };
+
+  const declaredLen = Number(desc.node?.fileLength) || 0;
+  if (declaredLen && declaredLen > MAX_MEDIA_BYTES) {
+    console.log("[wa] media too large, skipping download:", phone, desc.kind, declaredLen);
+    await sendNote(`📎 ${desc.filename || desc.kind} (завеликий файл)`);
+    return;
+  }
+
+  let buffer;
+  try {
+    buffer = await downloadMediaMessage(
+      msg,
+      "buffer",
+      {},
+      { logger, reuploadRequest: sock.updateMediaMessage }
+    );
+  } catch (e) {
+    console.error("[wa] media download failed:", e?.message);
+    await sendNote();
+    return;
+  }
+  if (buffer && buffer.length > MAX_MEDIA_BYTES) {
+    await sendNote(`📎 ${desc.filename || desc.kind} (завеликий файл)`);
+    return;
+  }
+
+  try {
+    const form = new FormData();
+    form.append("from", phone);
+    form.append("kind", desc.kind);
+    form.append("mime", desc.mime);
+    if (desc.filename) form.append("filename", desc.filename);
+    if (caption) form.append("caption", caption);
+    if (msg.key?.id) form.append("messageId", msg.key.id);
+    if (pushname) form.append("pushname", pushname);
+    if (desc.durationSec) form.append("durationSec", String(desc.durationSec));
+    form.append(
+      "file",
+      new Blob([buffer], { type: desc.mime }),
+      desc.filename || `wa-${desc.kind}`
+    );
+    const res = await fetch(mediaUrl, {
+      method: "POST",
+      headers: { "x-bridge-secret": BRIDGE_SECRET },
+      body: form,
+    });
+    if (!res.ok) {
+      console.error("[wa] media webhook non-ok:", res.status, await res.text());
+    }
+  } catch (e) {
+    console.error("[wa] media webhook error:", e.message);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -238,25 +339,34 @@ async function handleUpsert({ messages, type }) {
       } else {
         // pushName is the sender's WhatsApp profile name; may be absent.
         const pushname = msg.pushName ?? null;
-        const payload = {
-          from: phone,
-          direction: "in",
-          pushname,
-          text,
-          messageId: msg.key.id,
-          timestamp: ts,
-          type: type_,
-          hasMedia: media,
-        };
-        console.log(
-          "[wa] inbound from",
-          phone,
-          pushname ? `(~${pushname})` : "",
-          "len=",
-          text.length
-        );
-        if (CRM_WEBHOOK_URL) {
-          await postToWebhook(CRM_WEBHOOK_URL, payload, "webhook");
+        const desc = mediaDescriptor(msg.message);
+        if (desc) {
+          // Media inbound: download the bytes and forward to the CRM's
+          // multipart endpoint (which stores + transcribes voice). `text`
+          // here is the caption, if any.
+          console.log("[wa] inbound media from", phone, desc.kind, pushname ? `(~${pushname})` : "");
+          await postMedia(msg, phone, pushname, desc, text, ts);
+        } else {
+          const payload = {
+            from: phone,
+            direction: "in",
+            pushname,
+            text,
+            messageId: msg.key.id,
+            timestamp: ts,
+            type: type_,
+            hasMedia: media,
+          };
+          console.log(
+            "[wa] inbound from",
+            phone,
+            pushname ? `(~${pushname})` : "",
+            "len=",
+            text.length
+          );
+          if (CRM_WEBHOOK_URL) {
+            await postToWebhook(CRM_WEBHOOK_URL, payload, "webhook");
+          }
         }
       }
     } catch (e) {
@@ -386,6 +496,7 @@ async function startSock() {
   try {
     const baileys = await import("@whiskeysockets/baileys");
     const makeWASocket = baileys.default;
+    downloadMediaMessage = baileys.downloadMediaMessage;
     const { useMultiFileAuthState, fetchLatestBaileysVersion, Browsers, DisconnectReason } =
       baileys;
     LOGGED_OUT_CODE = DisconnectReason.loggedOut;

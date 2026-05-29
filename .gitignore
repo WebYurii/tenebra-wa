@@ -1,6 +1,9 @@
 node_modules/
 logs/
 .wwebjs_auth/
+.wwebjs_auth.bak.*/
 .wwebjs_cache/
+baileys_auth/
 *.log
 .env
+index.js.bak-*

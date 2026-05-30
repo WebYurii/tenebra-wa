@@ -38,6 +38,12 @@ const state = {
 
 const lastSendAt = { ts: 0 };
 const MIN_SEND_INTERVAL_MS = 5000;
+// Baileys closes the socket on routine, self-healing events (515 restart-required,
+// transient stream "Connection Terminated", network blips) and we reconnect within
+// seconds. Don't alert the operator on those — only fire the "disconnected" Telegram
+// ping if we're STILL down after this grace window. A real outage easily outlasts it.
+const DISCONNECT_NOTIFY_GRACE_MS = 90 * 1000;
+let disconnectNotifyTimer = null; // pending grace-period notify, cancelled on reconnect
 // Don't try to download/forward media larger than this (memory + transcribe
 // cost guard). Bigger files are logged as a note with the filename only.
 const MAX_MEDIA_BYTES = 25 * 1024 * 1024;
@@ -439,6 +445,12 @@ async function onConnectionUpdate(u) {
   }
 
   if (connection === "open") {
+    // Reconnected within the grace window — the earlier close was transient,
+    // so cancel the pending "disconnected" alert before it ever reaches Telegram.
+    if (disconnectNotifyTimer) {
+      clearTimeout(disconnectNotifyTimer);
+      disconnectNotifyTimer = null;
+    }
     state.status = "ready";
     state.readySince = new Date().toISOString();
     state.qrDataUrl = null;
@@ -472,6 +484,10 @@ async function onConnectionUpdate(u) {
       // surfaces a fresh QR instead of looping on a rejected session.
       state.status = "auth_failure";
       state.lastError = "logged_out";
+      if (disconnectNotifyTimer) {
+        clearTimeout(disconnectNotifyTimer);
+        disconnectNotifyTimer = null;
+      }
       notifyStatus("auth_failure", "logged_out", previousPhone);
       try {
         fs.rmSync(AUTH_DIR, { recursive: true, force: true });
@@ -482,7 +498,16 @@ async function onConnectionUpdate(u) {
     } else {
       state.status = "disconnected";
       state.lastError = reason;
-      notifyStatus("disconnected", reason, previousPhone);
+      // Defer the alert: most closes here recover on the 5s reconnect below.
+      // Only notify if we're still not "ready" once the grace window elapses;
+      // a successful reconnect ("open") clears this timer first.
+      if (disconnectNotifyTimer) clearTimeout(disconnectNotifyTimer);
+      disconnectNotifyTimer = setTimeout(() => {
+        disconnectNotifyTimer = null;
+        if (state.status !== "ready") {
+          notifyStatus("disconnected", reason, previousPhone);
+        }
+      }, DISCONNECT_NOTIFY_GRACE_MS);
       setTimeout(() => startSock().catch(() => {}), 5000);
     }
   }

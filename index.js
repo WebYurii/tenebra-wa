@@ -15,6 +15,20 @@ const CRM_CALL_WEBHOOK_URL =
 const CRM_STATUS_WEBHOOK_URL =
   process.env.CRM_STATUS_WEBHOOK_URL ||
   (CRM_WEBHOOK_URL ? CRM_WEBHOOK_URL + "/status" : null);
+const CRM_GROUP_WEBHOOK_URL =
+  process.env.CRM_GROUP_WEBHOOK_URL ||
+  (CRM_WEBHOOK_URL ? CRM_WEBHOOK_URL + "/group" : null);
+// Group chats don't fit the CRM client model, so by default we drop them.
+// To forward a group to Telegram, add its JID ("<id>@g.us") to this
+// comma-separated whitelist. Empty = forward nothing; non-whitelisted
+// groups are logged once (with subject) and listed via GET /groups so you
+// can pick which to add.
+const WA_GROUP_WHITELIST = new Set(
+  (process.env.WA_GROUP_WHITELIST || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+);
 // Baileys keeps its linked-device session here (multi-file auth state).
 // This intentionally differs from the old wwebjs ./.wwebjs_auth — the
 // session formats are incompatible, so the migration requires one QR
@@ -300,6 +314,71 @@ async function postMedia(msg, phone, pushname, desc, caption, ts) {
 // Baileys event handlers
 // ---------------------------------------------------------------------------
 
+// Group subject (name) cache — groupMetadata is a network round-trip, so we
+// memoise per JID. Subjects rarely change; a restart re-fetches.
+const groupSubjectCache = new Map(); // jid -> subject
+async function groupSubject(jid) {
+  if (groupSubjectCache.has(jid)) return groupSubjectCache.get(jid);
+  try {
+    const meta = await sock.groupMetadata(jid);
+    const subj = meta?.subject || jid;
+    groupSubjectCache.set(jid, subj);
+    return subj;
+  } catch {
+    return jid;
+  }
+}
+
+// Relay a group message to Telegram (via the CRM group webhook) — only for
+// whitelisted groups. Non-whitelisted groups are logged with their JID +
+// subject so the operator can add them to WA_GROUP_WHITELIST.
+async function handleGroupMessage(msg, groupJid) {
+  // Don't ring on our own messages sent into the group.
+  if (msg.key?.fromMe) return;
+
+  const text = extractText(msg.message) || "";
+  const type_ = messageType(msg.message);
+  const media = hasMediaContent(msg.message);
+  // Skip protocol/system noise (receipts, reactions, app-state syncs).
+  if (!text && !media && type_ === "unknown") return;
+
+  if (!WA_GROUP_WHITELIST.has(groupJid)) {
+    const subj = await groupSubject(groupJid);
+    console.log(`[wa] group not whitelisted, skipping: ${groupJid} "${subj}"`);
+    return;
+  }
+
+  // Sender within the group: participant JID may be a LID alias; reuse the
+  // same phone resolution as 1-on-1 so we show a real number when possible.
+  rememberLid(msg.key?.participant, msg.participantAlt);
+  const senderJid = resolvePnJid(msg.key?.participant, msg.participantAlt);
+  const senderPhone = senderJid ? jidToPhone(senderJid) : null;
+  const senderName = msg.pushName ?? null;
+  const subject = await groupSubject(groupJid);
+  const ts = Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000);
+
+  const payload = {
+    groupJid,
+    subject,
+    senderPhone,
+    senderName,
+    text,
+    type: type_,
+    hasMedia: media,
+    messageId: msg.key?.id ?? null,
+    timestamp: ts,
+  };
+  console.log(
+    `[wa] group "${subject}" from`,
+    senderName ? `~${senderName}` : senderPhone || "?",
+    "len=",
+    text.length
+  );
+  if (CRM_GROUP_WEBHOOK_URL) {
+    await postToWebhook(CRM_GROUP_WEBHOOK_URL, payload, "group-webhook");
+  }
+}
+
 // messages.upsert covers both directions: messages we receive (fromMe=false)
 // and messages sent from any of the operator's devices incl. this bridge
 // (fromMe=true). We only act on type === "notify" (live messages); "append"
@@ -309,8 +388,15 @@ async function handleUpsert({ messages, type }) {
   for (const msg of messages || []) {
     try {
       rememberLid(msg.key?.remoteJid, msg.key?.remoteJidAlt);
+      const remoteJid = msg.key?.remoteJid || "";
+      // Group messages are handled separately: they don't map to a client,
+      // we only relay whitelisted ones to Telegram.
+      if (typeof remoteJid === "string" && remoteJid.endsWith("@g.us")) {
+        await handleGroupMessage(msg, remoteJid);
+        continue;
+      }
       const pnJid = resolvePnJid(msg.key?.remoteJid, msg.key?.remoteJidAlt);
-      if (!pnJid) continue; // groups / broadcast / status / unresolved lid
+      if (!pnJid) continue; // broadcast / status / unresolved lid
       const phone = jidToPhone(pnJid);
       if (!phone) continue;
 
@@ -593,6 +679,27 @@ function requireSecret(req, res, next) {
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true, status: state.status });
+});
+
+// List all groups this account participates in, with their JIDs + subjects.
+// Discovery aid for WA_GROUP_WHITELIST — `whitelisted` flags which already
+// forward. e.g. curl -H "x-bridge-secret: …" 127.0.0.1:8005/groups
+app.get("/groups", requireSecret, async (_req, res) => {
+  if (state.status !== "ready" || !sock) {
+    return res.status(409).json({ ok: false, error: "not_ready", status: state.status });
+  }
+  try {
+    const all = await sock.groupFetchAllParticipating();
+    const groups = Object.values(all || {}).map((g) => ({
+      jid: g.id,
+      subject: g.subject || null,
+      participants: Array.isArray(g.participants) ? g.participants.length : null,
+      whitelisted: WA_GROUP_WHITELIST.has(g.id),
+    }));
+    res.json({ ok: true, count: groups.length, groups });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message || "fetch_failed" });
+  }
 });
 
 app.get("/status", requireSecret, (_req, res) => {

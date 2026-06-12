@@ -654,7 +654,8 @@ async function startSock() {
 // ---------------------------------------------------------------------------
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+// 34mb: send-media приймає base64-файли до ~24MB (КП PDF, фото, креслення).
+app.use(express.json({ limit: "34mb" }));
 
 const BRIDGE_SECRET_BUF = Buffer.from(BRIDGE_SECRET, "utf8");
 
@@ -751,6 +752,71 @@ app.post("/send", requireSecret, async (req, res) => {
     res.json({ ok: true, messageId: sent?.key?.id });
   } catch (e) {
     console.error("[wa] send error:", e);
+    res.status(500).json({ ok: false, error: e.message || "send_failed" });
+  }
+});
+
+// Outbound media: КП-PDF, фото, креслення прямо з картки клієнта в CRM.
+// Файл приходить base64 у JSON (див. express.json limit вище), щоб не
+// тягнути multipart; kind "image" шле як фото з підписом, решта — документом
+// зі збереженням імені файлу. Ліміт — той самий MAX_MEDIA_BYTES, що й
+// для вхідних медіа.
+app.post("/send-media", requireSecret, async (req, res) => {
+  if (state.status !== "ready" || !sock) {
+    return res
+      .status(409)
+      .json({ ok: false, error: "not_ready", status: state.status });
+  }
+  const { to, dataBase64, mimetype, filename, kind, caption } = req.body || {};
+  if (!to || !dataBase64 || !mimetype) {
+    return res.status(400).json({ ok: false, error: "missing_fields" });
+  }
+  let buf = null;
+  try {
+    buf = Buffer.from(String(dataBase64), "base64");
+  } catch {}
+  if (!buf || buf.length === 0) {
+    return res.status(400).json({ ok: false, error: "bad_data" });
+  }
+  if (buf.length > MAX_MEDIA_BYTES) {
+    return res.status(400).json({ ok: false, error: "too_large" });
+  }
+
+  const now = Date.now();
+  const wait = MIN_SEND_INTERVAL_MS - (now - lastSendAt.ts);
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+  lastSendAt.ts = Date.now();
+
+  const digits = String(to).replace(/\D/g, "");
+  if (!digits) return res.status(400).json({ ok: false, error: "invalid_phone" });
+
+  try {
+    const results = await sock.onWhatsApp(digits);
+    const hit = Array.isArray(results) ? results.find((r) => r && r.exists) : null;
+    if (!hit) {
+      return res.status(404).json({ ok: false, error: "not_on_whatsapp" });
+    }
+    const cap = caption && String(caption).trim() ? String(caption) : undefined;
+    const content =
+      kind === "image"
+        ? { image: buf, caption: cap }
+        : {
+            document: buf,
+            mimetype: String(mimetype),
+            fileName: String(filename || "file"),
+            caption: cap,
+          };
+    const sent = await sock.sendMessage(hit.jid, content);
+    console.log(
+      "[wa] outbound media to",
+      "+" + digits,
+      kind === "image" ? "image" : "document",
+      "len=",
+      buf.length
+    );
+    res.json({ ok: true, messageId: sent?.key?.id });
+  } catch (e) {
+    console.error("[wa] send-media error:", e);
     res.status(500).json({ ok: false, error: e.message || "send_failed" });
   }
 });

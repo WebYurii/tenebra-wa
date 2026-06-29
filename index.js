@@ -474,22 +474,38 @@ async function handleCall(calls) {
   for (const call of calls || []) {
     try {
       if (call.status && call.status !== "offer") continue;
-      const jid = resolvePnJid(
-        call.from || call.chatId || call.peerJid,
-        call.fromAlt
-      );
-      if (!jid) {
-        console.log("[wa] call from unresolved jid, skipping ping:", call.from);
-        continue;
+      const primary = call.from || call.chatId || call.peerJid;
+      let jid = resolvePnJid(primary, call.fromAlt);
+
+      // Calls are usually addressed by @lid (no phone alt rides along), so the
+      // local cache often can't resolve them. Ask Baileys' authoritative
+      // on-device LID→PN map (persists in creds, survives restarts, can usync
+      // the server) before giving up.
+      if (!jid && typeof primary === "string" && primary.endsWith("@lid")) {
+        try {
+          const pn = await sock?.signalRepository?.lidMapping?.getPNForLID?.(primary);
+          if (pn) {
+            jid = pn;
+            rememberLid(primary, pn);
+          }
+        } catch (e) {
+          console.error("[wa] getPNForLID failed:", e?.message || e);
+        }
       }
-      const phone = jidToPhone(jid);
+
+      const phone = jid ? jidToPhone(jid) : null;
       let ts = Math.floor(Date.now() / 1000);
       if (call.date) {
         const d = new Date(call.date).getTime();
         if (!Number.isNaN(d)) ts = Math.floor(d / 1000);
       }
+      // Never drop a missed call: even if we couldn't resolve the number, ping
+      // Telegram with an "unresolved" marker so the operator knows someone
+      // called and can check WhatsApp (previously these were silently skipped).
       const payload = {
-        from: phone,
+        from: phone || "",
+        unresolved: !phone,
+        lid: !phone && typeof primary === "string" ? primary : undefined,
         callId: call.id ?? null,
         timestamp: ts,
         isVideo: !!call.isVideo,
@@ -499,7 +515,7 @@ async function handleCall(calls) {
       };
       console.log(
         "[wa] incoming call from",
-        phone,
+        phone || `unresolved (${primary})`,
         payload.isVideo ? "(video)" : ""
       );
       if (CRM_CALL_WEBHOOK_URL) {

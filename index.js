@@ -58,6 +58,13 @@ const MIN_SEND_INTERVAL_MS = 5000;
 // ping if we're STILL down after this grace window. A real outage easily outlasts it.
 const DISCONNECT_NOTIFY_GRACE_MS = 90 * 1000;
 let disconnectNotifyTimer = null; // pending grace-period notify, cancelled on reconnect
+// Unscanned-QR pairing cycles end in a 408 close every ~3 minutes. Left alone
+// the bridge would loop QR codes (and, before this guard, Telegram alerts)
+// forever. After QR_MAX_CYCLES we pause instead of reconnecting; polling
+// /status or /qr (the integrations page does both) revives pairing with a
+// fresh QR, so opening the page is all the operator needs to do.
+const QR_MAX_CYCLES = 3;
+let qrCycles = 0;
 // Don't try to download/forward media larger than this (memory + transcribe
 // cost guard). Bigger files are logged as a note with the filename only.
 const MAX_MEDIA_BYTES = 25 * 1024 * 1024;
@@ -553,6 +560,7 @@ async function onConnectionUpdate(u) {
       clearTimeout(disconnectNotifyTimer);
       disconnectNotifyTimer = null;
     }
+    qrCycles = 0;
     state.status = "ready";
     state.readySince = new Date().toISOString();
     state.qrDataUrl = null;
@@ -571,6 +579,7 @@ async function onConnectionUpdate(u) {
     const reason = lastDisconnect?.error?.message || String(code || "unknown");
     const loggedOut = code === LOGGED_OUT_CODE;
     const previousPhone = state.phone;
+    const wasPairing = state.status === "qr_pending";
     console.log(
       "[wa] connection closed:",
       code,
@@ -586,6 +595,7 @@ async function onConnectionUpdate(u) {
       // surfaces a fresh QR instead of looping on a rejected session.
       state.status = "auth_failure";
       state.lastError = "logged_out";
+      qrCycles = 0; // fresh pairing ahead — give it the full QR budget
       if (disconnectNotifyTimer) {
         clearTimeout(disconnectNotifyTimer);
         disconnectNotifyTimer = null;
@@ -600,16 +610,36 @@ async function onConnectionUpdate(u) {
     } else {
       state.status = "disconnected";
       state.lastError = reason;
-      // Defer the alert: most closes here recover on the 5s reconnect below.
-      // Only notify if we're still not "ready" once the grace window elapses;
-      // a successful reconnect ("open") clears this timer first.
-      if (disconnectNotifyTimer) clearTimeout(disconnectNotifyTimer);
-      disconnectNotifyTimer = setTimeout(() => {
-        disconnectNotifyTimer = null;
-        if (state.status !== "ready") {
-          notifyStatus("disconnected", reason, previousPhone);
+
+      if (wasPairing) {
+        // Nobody scanned this QR round. Silent by design — the operator
+        // already got the auth_failure alert that started the pairing; more
+        // pings add nothing. Retry a few rounds, then pause until the
+        // integrations page is opened (its polling calls kickIfIdle).
+        qrCycles += 1;
+        state.qrDataUrl = null;
+        state.qrText = null;
+        if (qrCycles >= QR_MAX_CYCLES) {
+          state.lastError = "qr_timeout";
+          console.log(
+            `[wa] QR unscanned after ${qrCycles} cycles — pairing paused; open /integrations for a fresh QR`
+          );
+          return;
         }
-      }, DISCONNECT_NOTIFY_GRACE_MS);
+      } else if (previousPhone) {
+        // A live session dropped. Defer the alert: most closes here recover
+        // on the 5s reconnect below; only notify if we're still not "ready"
+        // once the grace window elapses ("open" clears this timer first).
+        // previousPhone is null on every repeat close of the same outage, so
+        // Telegram gets at most one ping per outage, not one per retry.
+        if (disconnectNotifyTimer) clearTimeout(disconnectNotifyTimer);
+        disconnectNotifyTimer = setTimeout(() => {
+          disconnectNotifyTimer = null;
+          if (state.status !== "ready") {
+            notifyStatus("disconnected", reason, previousPhone);
+          }
+        }, DISCONNECT_NOTIFY_GRACE_MS);
+      }
       setTimeout(() => startSock().catch(() => {}), 5000);
     }
   }
@@ -694,6 +724,15 @@ function requireSecret(req, res, next) {
   next();
 }
 
+// Revive a paused pairing loop (see QR_MAX_CYCLES). The integrations page
+// polls /status every 4s while open, so just visiting it brings a fresh QR.
+function kickIfIdle() {
+  if (!sock && !starting) {
+    qrCycles = 0;
+    startSock().catch(() => {});
+  }
+}
+
 app.get("/health", (_req, res) => {
   res.json({ ok: true, status: state.status });
 });
@@ -720,6 +759,7 @@ app.get("/groups", requireSecret, async (_req, res) => {
 });
 
 app.get("/status", requireSecret, (_req, res) => {
+  kickIfIdle();
   res.json({
     ok: true,
     status: state.status,
@@ -732,6 +772,7 @@ app.get("/status", requireSecret, (_req, res) => {
 });
 
 app.get("/qr", requireSecret, (_req, res) => {
+  kickIfIdle();
   if (!state.qrDataUrl) {
     return res.json({ ok: false, error: "no_qr", status: state.status });
   }

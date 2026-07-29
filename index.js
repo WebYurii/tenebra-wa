@@ -78,6 +78,21 @@ let starting = false; // guard against overlapping (re)connects
 let LOGGED_OUT_CODE = 401; // DisconnectReason.loggedOut, set on first import
 let downloadMediaMessage = null; // bound from the Baileys import in startSock
 
+// --- сторож зависаний -------------------------------------------------------
+// Переподключение живёт на событии "close". Но сокет умеет зависать без него:
+// 29.07.2026 после 405 новый сокет замер в "connecting" на 15 часов — pm2
+// зелёный, /status отвечает "authenticated", сообщений нет. Отсюда независимый
+// таймер: если статус не рабочий дольше порога, рвём сокет руками.
+const { isStuck } = require("./lib/watchdog");
+const STUCK_AFTER_MS = parseInt(process.env.WA_STUCK_AFTER_MS || "180000", 10);
+const WATCHDOG_EVERY_MS = parseInt(process.env.WA_WATCHDOG_EVERY_MS || "60000", 10);
+let statusSince = Date.now(); // когда state.status сменился в последний раз
+
+function setStatus(next) {
+  if (state.status !== next) statusSince = Date.now();
+  state.status = next;
+}
+
 // ---------------------------------------------------------------------------
 // CRM webhook plumbing — unchanged from the wwebjs bridge so the CRM side
 // (signature verification + payload shape) keeps working byte-for-byte.
@@ -541,7 +556,7 @@ async function onConnectionUpdate(u) {
     try {
       state.qrDataUrl = await QRCode.toDataURL(qr, { width: 320, margin: 1 });
       state.qrText = qr;
-      state.status = "qr_pending";
+      setStatus("qr_pending");
       state.lastError = null;
       console.log("[wa] QR received, length:", qr.length);
     } catch (e) {
@@ -550,7 +565,7 @@ async function onConnectionUpdate(u) {
   }
 
   if (connection === "connecting" && state.status !== "qr_pending") {
-    state.status = "authenticated";
+    setStatus("authenticated");
   }
 
   if (connection === "open") {
@@ -561,7 +576,7 @@ async function onConnectionUpdate(u) {
       disconnectNotifyTimer = null;
     }
     qrCycles = 0;
-    state.status = "ready";
+    setStatus("ready");
     state.readySince = new Date().toISOString();
     state.qrDataUrl = null;
     state.qrText = null;
@@ -593,7 +608,7 @@ async function onConnectionUpdate(u) {
     if (loggedOut) {
       // Session is dead on WhatsApp's side — wipe creds so the next connect
       // surfaces a fresh QR instead of looping on a rejected session.
-      state.status = "auth_failure";
+      setStatus("auth_failure");
       state.lastError = "logged_out";
       qrCycles = 0; // fresh pairing ahead — give it the full QR budget
       if (disconnectNotifyTimer) {
@@ -608,7 +623,7 @@ async function onConnectionUpdate(u) {
       }
       setTimeout(() => startSock().catch(() => {}), 2000);
     } else {
-      state.status = "disconnected";
+      setStatus("disconnected");
       state.lastError = reason;
 
       if (wasPairing) {
@@ -686,7 +701,7 @@ async function startSock() {
     sock.ev.on("call", handleCall);
   } catch (e) {
     console.error("[wa] startSock error:", e);
-    state.status = "error";
+    setStatus("error");
     state.lastError = e.message;
     sock = null;
     setTimeout(() => startSock().catch(() => {}), 5000);
@@ -883,12 +898,36 @@ app.post("/logout", requireSecret, async (_req, res) => {
     // logout() triggers a connection close with loggedOut, which wipes the
     // creds and re-arms a fresh QR via onConnectionUpdate.
     if (sock) await sock.logout();
-    state.status = "disconnected";
+    setStatus("disconnected");
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
+
+// Раз в минуту смотрим, не завис ли мост в нерабочем состоянии. Сокет рвём
+// руками: обнуляем ссылку (иначе startSock выйдет по своей же защите) и
+// закрываем ws, чтобы Baileys не оставил висеть сессию.
+function forceReconnect(why) {
+  const dead = sock;
+  sock = null;
+  starting = false;
+  state.lastError = why;
+  try {
+    dead?.ws?.close?.();
+  } catch {}
+  try {
+    dead?.end?.(new Error(why));
+  } catch {}
+  setTimeout(() => startSock().catch(() => {}), 1000);
+}
+
+setInterval(() => {
+  if (!isStuck(state.status, statusSince, Date.now(), STUCK_AFTER_MS)) return;
+  const secs = Math.round((Date.now() - statusSince) / 1000);
+  console.log(`[wa] watchdog: статус "${state.status}" не меняется ${secs}с — перезапускаю сокет`);
+  forceReconnect(`watchdog: stuck in ${state.status} for ${secs}s`);
+}, WATCHDOG_EVERY_MS);
 
 app.listen(PORT, HOST, () => {
   console.log(`[wa] bridge listening on ${HOST}:${PORT}`);
@@ -897,7 +936,7 @@ app.listen(PORT, HOST, () => {
 console.log("[wa] initializing Baileys client…");
 startSock().catch((e) => {
   console.error("[wa] initialize error:", e);
-  state.status = "error";
+  setStatus("error");
   state.lastError = e.message;
 });
 

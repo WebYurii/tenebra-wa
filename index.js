@@ -5,6 +5,7 @@ const fs = require("node:fs");
 const QRCode = require("qrcode");
 const pino = require("pino");
 const { packForm, signBody } = require("./lib/signed-body");
+const { pickHistoryMedia } = require("./lib/history-pick");
 
 const PORT = parseInt(process.env.PORT || "8005", 10);
 const HOST = process.env.HOST || "127.0.0.1";
@@ -706,6 +707,16 @@ async function startSock() {
     sock.ev.on("connection.update", onConnectionUpdate);
     sock.ev.on("messages.upsert", handleUpsert);
     sock.ev.on("call", handleCall);
+    // Телефон присылает историю не сразу и не обязательно в окно ожидания
+    // /pull-history — по этой строке видно, дошёл ли ответ вообще.
+    sock.ev.on("messaging-history.set", (h) => {
+      console.log(
+        "[wa] history sync:",
+        "messages=", h?.messages?.length ?? 0,
+        "syncType=", h?.syncType ?? null,
+        "isLatest=", h?.isLatest ?? null
+      );
+    });
   } catch (e) {
     console.error("[wa] startSock error:", e);
     setStatus("error");
@@ -898,6 +909,69 @@ app.post("/send-media", requireSecret, async (req, res) => {
     console.error("[wa] send-media error:", e);
     res.status(500).json({ ok: false, error: e.message || "send_failed" });
   }
+});
+
+// Подтянуть пропущенное медиа из истории WhatsApp.
+//
+// Понадобилось, когда выяснилось, что с 26.07 мост не подписывал multipart и
+// CRM отбивала каждое медиа: сообщения давно пришли, а ни файла, ни
+// расшифровки нигде нет. Телефон историю хранит и умеет отдать её по запросу
+// (on-demand history sync), а в ней лежат mediaKey/directPath — значит, файл
+// ещё можно скачать и провести обычным путём: CRM сохранит, расшифрует и
+// пришлёт в Телеграм.
+//
+// Якорь (anchorId/anchorTs) — ключ известного сообщения из того же чата:
+// телефон отдаёт то, что было ДО него. messageId живых сообщений лежит в
+// активностях CRM.
+app.post("/pull-history", requireSecret, async (req, res) => {
+  if (!sock || state.status !== "ready") {
+    return res.status(409).json({ ok: false, error: "not_ready" });
+  }
+  const { phone, anchorId, anchorTs, fromMe, count, kinds, waitMs } = req.body || {};
+  const digits = String(phone ?? "").replace(/\D/g, "");
+  if (!digits || !anchorId || !anchorTs) {
+    return res.status(400).json({ ok: false, error: "missing_fields" });
+  }
+  const jid = `${digits}@s.whatsapp.net`;
+  const want = Array.isArray(kinds) && kinds.length ? new Set(kinds) : null;
+  const seen = [];
+  const collected = [];
+
+  const onHistory = (payload) => {
+    const picked = pickHistoryMedia(payload?.messages, {
+      jid,
+      want,
+      describe: mediaDescriptor,
+    });
+    seen.push(...picked.seen);
+    collected.push(...picked.collected);
+  };
+
+  sock.ev.on("messaging-history.set", onHistory);
+  try {
+    await sock.fetchMessageHistory(
+      Math.min(Number(count) || 20, 50),
+      { remoteJid: jid, id: String(anchorId), fromMe: !!fromMe },
+      Number(anchorTs)
+    );
+    // Телефон отвечает не мгновенно: ждём, пока прилетит история.
+    await new Promise((r) => setTimeout(r, Math.min(Number(waitMs) || 25000, 60000)));
+  } catch (e) {
+    sock.ev.off("messaging-history.set", onHistory);
+    console.error("[wa] pull-history failed:", e?.message);
+    return res.status(502).json({ ok: false, error: "fetch_failed", detail: e?.message });
+  }
+  sock.ev.off("messaging-history.set", onHistory);
+
+  const sent = [];
+  for (const { msg, desc } of collected) {
+    const ts = Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000);
+    const caption = extractText(msg.message) || "";
+    console.log("[wa] pull-history media", digits, desc.kind, msg.key.id);
+    await postMedia(msg, `+${digits}`, msg.pushName ?? null, desc, caption, ts);
+    sent.push({ id: msg.key.id, kind: desc.kind, ts });
+  }
+  res.json({ ok: true, seen: seen.length, sent });
 });
 
 app.post("/logout", requireSecret, async (_req, res) => {

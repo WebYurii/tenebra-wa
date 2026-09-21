@@ -5,7 +5,7 @@ const fs = require("node:fs");
 const QRCode = require("qrcode");
 const pino = require("pino");
 const { packForm, signBody } = require("./lib/signed-body");
-const { pickHistoryMedia } = require("./lib/history-pick");
+const { pickHistoryMedia, toMillis } = require("./lib/history-pick");
 
 const PORT = parseInt(process.env.PORT || "8005", 10);
 const HOST = process.env.HOST || "127.0.0.1";
@@ -927,12 +927,30 @@ app.post("/pull-history", requireSecret, async (req, res) => {
   if (!sock || state.status !== "ready") {
     return res.status(409).json({ ok: false, error: "not_ready" });
   }
-  const { phone, anchorId, anchorTs, fromMe, count, kinds, waitMs } = req.body || {};
+  const { phone, anchorId, anchorTs, fromMe, count, kinds, waitMs, jid: jidOverride } =
+    req.body || {};
   const digits = String(phone ?? "").replace(/\D/g, "");
   if (!digits || !anchorId || !anchorTs) {
     return res.status(400).json({ ok: false, error: "missing_fields" });
   }
-  const jid = `${digits}@s.whatsapp.net`;
+  // Чат можно задать явно, а "lid" — попросить Baileys найти LID-адрес
+  // собеседника: 1:1-чаты WhatsApp давно адресуются им, и телефон может
+  // не узнать чат по номеру.
+  let jid = String(jidOverride || `${digits}@s.whatsapp.net`);
+  if (jidOverride === "lid") {
+    try {
+      const lid = await sock.signalRepository?.lidMapping?.getLIDForPN(
+        `${digits}@s.whatsapp.net`
+      );
+      if (!lid) {
+        return res.status(404).json({ ok: false, error: "lid_not_found" });
+      }
+      jid = lid;
+    } catch (e) {
+      return res.status(502).json({ ok: false, error: "lid_lookup_failed", detail: e?.message });
+    }
+  }
+  const anchorMs = toMillis(anchorTs);
   const want = Array.isArray(kinds) && kinds.length ? new Set(kinds) : null;
   const seen = [];
   const collected = [];
@@ -952,7 +970,7 @@ app.post("/pull-history", requireSecret, async (req, res) => {
     await sock.fetchMessageHistory(
       Math.min(Number(count) || 20, 50),
       { remoteJid: jid, id: String(anchorId), fromMe: !!fromMe },
-      Number(anchorTs)
+      anchorMs
     );
     // Телефон отвечает не мгновенно: ждём, пока прилетит история.
     await new Promise((r) => setTimeout(r, Math.min(Number(waitMs) || 25000, 60000)));

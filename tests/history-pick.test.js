@@ -8,7 +8,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert");
-const { pickHistoryMedia } = require("../lib/history-pick");
+const { pickHistoryMedia, toMillis } = require("../lib/history-pick");
 
 const JID = "380689624497@s.whatsapp.net";
 
@@ -79,5 +79,19 @@ test("пустая история и мусор не роняют отбор", (
   for (const input of [undefined, null, [], [null], [{}]]) {
     const r = pickHistoryMedia(input, { jid: JID, want: null, describe });
     assert.equal(r.collected.length, 0);
+  }
+});
+
+// Якорь времени: Baileys ждёт миллисекунды, а секунды телефон игнорирует
+// молча — ни ошибки, ни события истории. Ловим это здесь.
+test("секунды превращаются в миллисекунды, миллисекунды остаются как есть", () => {
+  assert.equal(toMillis(1789973219), 1789973219000);
+  assert.equal(toMillis(1789973219000), 1789973219000);
+  assert.equal(toMillis("1789973219"), 1789973219000);
+});
+
+test("мусор во времени не улетает в запрос", () => {
+  for (const bad of [undefined, null, 0, -5, "завтра", NaN]) {
+    assert.equal(toMillis(bad), 0);
   }
 });

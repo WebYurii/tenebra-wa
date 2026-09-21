@@ -1,9 +1,10 @@
 require("dotenv").config();
 const express = require("express");
-const { createHmac, timingSafeEqual } = require("node:crypto");
+const { timingSafeEqual } = require("node:crypto");
 const fs = require("node:fs");
 const QRCode = require("qrcode");
 const pino = require("pino");
+const { packForm, signBody } = require("./lib/signed-body");
 
 const PORT = parseInt(process.env.PORT || "8005", 10);
 const HOST = process.env.HOST || "127.0.0.1";
@@ -116,9 +117,7 @@ async function notifyStatus(status, reason, phone) {
 async function postToWebhook(url, payload, label) {
   try {
     const bodyStr = JSON.stringify(payload);
-    const signature =
-      "sha256=" +
-      createHmac("sha256", BRIDGE_SECRET).update(bodyStr).digest("hex");
+    const signature = signBody(BRIDGE_SECRET, bodyStr);
     const res = await fetch(url, {
       method: "POST",
       headers: {
@@ -319,10 +318,18 @@ async function postMedia(msg, phone, pushname, desc, caption, ts) {
       new Blob([buffer], { type: desc.mime }),
       desc.filename || `wa-${desc.kind}`
     );
+    // Тело собираем сами, а не отдаём FormData в fetch: подпись должна
+    // накрывать ровно те байты, которые прочитает CRM (там HMAC считают по
+    // сырому телу запроса).
+    const { body, contentType } = await packForm(form);
     const res = await fetch(mediaUrl, {
       method: "POST",
-      headers: { "x-bridge-secret": BRIDGE_SECRET },
-      body: form,
+      headers: {
+        "content-type": contentType,
+        "x-bridge-secret": BRIDGE_SECRET,
+        "x-bridge-signature": signBody(BRIDGE_SECRET, body),
+      },
+      body,
     });
     if (!res.ok) {
       console.error("[wa] media webhook non-ok:", res.status, await res.text());

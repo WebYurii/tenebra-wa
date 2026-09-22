@@ -258,7 +258,7 @@ function mediaDescriptor(message) {
 // Download a media message and forward the bytes (+ metadata) to the CRM's
 // multipart media webhook. Falls back to a plain text note if download fails
 // or the file is too big, so the message is never silently dropped.
-async function postMedia(msg, phone, pushname, desc, caption, ts) {
+async function postMedia(msg, phone, pushname, desc, caption, ts, direction = "in") {
   if (!CRM_WEBHOOK_URL) return;
   const mediaUrl = CRM_WEBHOOK_URL + "/media";
 
@@ -267,7 +267,7 @@ async function postMedia(msg, phone, pushname, desc, caption, ts) {
       CRM_WEBHOOK_URL,
       {
         from: phone,
-        direction: "in",
+        direction,
         pushname,
         text: caption || note || "",
         messageId: msg.key?.id,
@@ -307,6 +307,7 @@ async function postMedia(msg, phone, pushname, desc, caption, ts) {
   try {
     const form = new FormData();
     form.append("from", phone);
+    form.append("direction", direction);
     form.append("kind", desc.kind);
     form.append("mime", desc.mime);
     if (desc.filename) form.append("filename", desc.filename);
@@ -445,6 +446,15 @@ async function handleUpsert({ messages, type }) {
         // Outbound capture — fires whenever the operator sends from phone,
         // another linked device, or this bridge. CRM treats `from` as the
         // other party (the recipient JID here).
+        const outDesc = mediaDescriptor(msg.message);
+        if (outDesc) {
+          // Фото/файл, надісланий з телефона: качаємо байти й віддаємо в CRM
+          // так само, як вхідне медіа. Інакше в хронології лишався порожній
+          // рядок «Ви → WhatsApp» без прев'ю і без файлу.
+          console.log("[wa] outbound media to", phone, outDesc.kind);
+          await postMedia(msg, phone, null, outDesc, text, ts, "out");
+          continue;
+        }
         const payload = {
           from: phone,
           direction: "out",
@@ -986,7 +996,15 @@ app.post("/pull-history", requireSecret, async (req, res) => {
     const ts = Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000);
     const caption = extractText(msg.message) || "";
     console.log("[wa] pull-history media", digits, desc.kind, msg.key.id);
-    await postMedia(msg, `+${digits}`, msg.pushName ?? null, desc, caption, ts);
+    await postMedia(
+      msg,
+      `+${digits}`,
+      msg.key?.fromMe ? null : msg.pushName ?? null,
+      desc,
+      caption,
+      ts,
+      msg.key?.fromMe ? "out" : "in"
+    );
     sent.push({ id: msg.key.id, kind: desc.kind, ts });
   }
   res.json({ ok: true, seen: seen.length, sent });
